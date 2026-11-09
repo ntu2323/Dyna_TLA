@@ -41,6 +41,42 @@
 (*      the recovered M's at StartView only once its clock has reached     *)
 (*      every deadline in them (D1 applied to the install path).           *)
 (*                                                                         *)
+(* Changes agreed 2026-11-07 (Scenario 1: a primary commits, executes and  *)
+(* serves a read, then crashes before anyone learns of the commit; recovery*)
+(* sees only SPEC and a deadline upgrade moves the write past the read):   *)
+(*  D8. DEADLINE UPGRADE THROUGH THE PRIMARY (switch UpgradeGate; replaces *)
+(*      D2/D3 for writes). A write whose leaders replied but that lacks    *)
+(*      f+1 replies may be upgraded: the client sends Upgrade(t', e+1) to  *)
+(*      the PRIMARY (min-id involved leader) only. The primary, atomically:*)
+(*      COMMITTED -> answers "committed at t" (client accepts t); decided  *)
+(*      but not yet durable (D9) -> holds the answer; otherwise PROMISES:  *)
+(*      moves to (t', e+1) and ignores every message of epoch e from then  *)
+(*      on. Only after the promise does the client cast t' to everyone.    *)
+(*      EPOCHS: e counts upgrades; entries and all commit/sync/replication *)
+(*      messages carry it; the recovery merge ranks COMMITTED first, then  *)
+(*      the highest epoch, then status, then t.                            *)
+(*      GHOST (switch Ghost): a server that moves a txn to a new epoch     *)
+(*      keeps it blocking conflicting txns from its old t until the txn is *)
+(*      COMMITTED (its final t may still fall back to the old one).        *)
+(*  D9. DURABLE COMMIT (switch DurableCommit). Primary: f ReplicatePrepare *)
+(*      acks -> "decided" (no upgrade promise any more), ReplicateCommit;  *)
+(*      f ReplicateCommit acks -> COMMITTED, and only then executes,       *)
+(*      serves reads behind it, or answers COMMITTED. Receivers of         *)
+(*      ReplicateCommit mark COMMITTED and ack. f+1 COMMITTED copies means *)
+(*      every recovery quorum sees one.                                    *)
+(*                                                                         *)
+(* Change of 2026-11-08 (TLC, REC/SCN1: a follower holds an on-time write  *)
+(* w before read r and endorses r; the leader served r without w, then     *)
+(* crashed; recovery sees only w at its t and commits it before r):        *)
+(*  D10. READ ENDORSEMENT CHECK (switch EndorseCheck). A follower's        *)
+(*      endorsement of read r carries, per key, the newest write it holds  *)
+(*      ordered before r. The read's fast path counts that endorsement     *)
+(*      only if it equals the leaders' results; otherwise the read waits   *)
+(*      for other replies or recasts. (A write committed before r has f+1  *)
+(*      on-time holders, which meet r's fast quorum: the leader includes   *)
+(*      it, or the follower holds it before endorsing -- arriving later it *)
+(*      is late there, since the follower's clock has reached r's t.)      *)
+(*                                                                         *)
 (* Recovery (design doc "Recovery"; Go internal/vr, orderer/recovery.go):  *)
 (*  - A view is (view id, alive set); its VR leader is the min-id alive    *)
 (*    server. A server may suspect any peer (failures or false suspicion), *)
@@ -96,10 +132,15 @@ CONSTANTS
     MaxCrashes,  \* bound on crashed servers
     TGuard,      \* TRUE: execution never overwrites a key with an older OrderKey
     \* Rule switches. The protocol under check: WaitRule = TRUE,
-    \* PrepOverwrites = FALSE, InstallWait = TRUE.
+    \* PrepOverwrites = FALSE, InstallWait = TRUE, UpgradeGate = TRUE,
+    \* Ghost = TRUE, DurableCommit = TRUE, EndorseCheck = TRUE.
     WaitRule,       \* D1 on/off
     PrepOverwrites, \* TRUE: old code -- ReplicatePrepare installs COMMITTING at t and acks
-    InstallWait     \* D7 on/off
+    InstallWait,    \* D7 on/off
+    UpgradeGate,    \* D8 on; FALSE: D2/D3 one-step recast for writes
+    Ghost,          \* D8 ghost blocking on/off
+    DurableCommit,  \* D9 on; FALSE: primary COMMITTED on f prepare acks (old)
+    EndorseCheck    \* D10 on; FALSE: follower read endorsements carry nothing (old)
 
 Servers  == 1..N
 F        == (N - 1) \div 2
@@ -139,11 +180,13 @@ Rank(st) == CASE st = "SPEC" -> 1 [] st = "COMMITTING" -> 2 [] OTHER -> 3
 (***************************************************************************)
 VARIABLES
     clock,    \* clock[s]
-    ent,      \* ent[s][i]: [loc, st, t, att]
+    ent,      \* ent[s][i]: [loc, st, t, att, ep, gt, dec]
               \*   loc: "none" | "early" | "late" | "spec" | "done"
               \*        ("done" = executed write / served leader read)
               \*   st : "NONE" | "SPEC" | "COMMITTING" | "COMMITTED"  (in spec)
               \*   t  : live deadline;  att: latest attempt seen
+              \*   ep : upgrade epoch (D8);  gt: ghost deadline (0 = none)
+              \*   dec: primary decided (ReplicateCommit sent), not yet durable (D9)
     highest,  \* highestReleasedT[s]: max OrderKey [t, id] ever appended to SpecLog
     store,    \* store[s][k] = [w |-> writer txn (0 = initial), t |-> its t]
     execSeq,  \* execSeq[s]: executed writes, in order, as <<id, t>>
@@ -154,8 +197,8 @@ VARIABLES
     oldA,     \* alive set recovery starts from (rec)
     ms,       \* ms[s][p]: PL p's M as received by s: [has, txns, kvs]
     msgs,     \* all messages ever sent
-    cl,       \* cl[i] = [phase, att, t, v, A]: the client driving txn i
-              \*   phase: "idle" | "wait" | "slow" | "done";  (v, A): its view
+    cl,       \* cl[i] = [phase, att, ep, t, v, A]: the client driving txn i
+              \*   phase: "idle" | "wait" | "slow" | "upg" | "done";  (v, A): its view
     cdone,    \* history: deadline at which the client considered i committed (0 = not)
     cres,     \* history: read results, a set of <<key, writer>>
     rt        \* history: rt[i] = txns completed (at their client) before i was invoked
@@ -165,7 +208,7 @@ serverOnly == <<store, execSeq>>
 clientVars == <<cl, cdone, cres, rt>>
 vars == <<clock, ent, highest, store, execSeq, vrVars, msgs, clientVars>>
 
-NoEnt == [loc |-> "none", st |-> "NONE", t |-> 0, att |-> 0]
+NoEnt == [loc |-> "none", st |-> "NONE", t |-> 0, att |-> 0, ep |-> 0, gt |-> 0, dec |-> FALSE]
 NoM   == [has |-> FALSE, txns |-> {}, kvs |-> {}]
 
 Init ==
@@ -182,7 +225,8 @@ Init ==
     /\ oldA    = [s \in Servers |-> Servers]
     /\ ms      = [s \in Servers |-> [p \in Servers |-> NoM]]
     /\ msgs    = {}
-    /\ cl      = [i \in Txns |-> [phase |-> "idle", att |-> 0, t |-> 0, v |-> 0, A |-> Servers]]
+    /\ cl      = [i \in Txns |-> [phase |-> "idle", att |-> 0, ep |-> 0, t |-> 0, v |-> 0,
+                                  A |-> Servers]]
     /\ cdone   = [i \in Txns |-> 0]
     /\ cres    = [i \in Txns |-> {}]
     /\ rt      = [i \in Txns |-> {}]
@@ -197,16 +241,20 @@ Leaders(s, i)  == LeadersIn(i, salive[s])
 IsLeader(s, i) == s \in Leaders(s, i)
 Primary(s, i)  == Min(Leaders(s, i))
 
-\* Message constructors (one record shape per type); v = sender's view.
-MReq(i, a, t, v, kind)      == [type |-> "Req", txn |-> i, att |-> a, t |-> t, v |-> v, kind |-> kind]
+\* Message constructors (one record shape per type); v = sender's view, e = epoch.
+MReq(i, a, t, v, kind, e)   == [type |-> "Req", txn |-> i, att |-> a, t |-> t, v |-> v, kind |-> kind,
+                                ep |-> e]
 MSpecRep(i, a, s, t, r, v)  == [type |-> "SpecRep", txn |-> i, att |-> a, from |-> s, t |-> t, res |-> r, v |-> v]
-MFast(i, a, t, v)           == [type |-> "FastCommit", txn |-> i, att |-> a, t |-> t, v |-> v]
-MSlow(i, a, t, v)           == [type |-> "SlowCommit", txn |-> i, att |-> a, t |-> t, v |-> v]
+MFast(i, a, t, v, e)        == [type |-> "FastCommit", txn |-> i, att |-> a, t |-> t, v |-> v, ep |-> e]
+MSlow(i, a, t, v, e)        == [type |-> "SlowCommit", txn |-> i, att |-> a, t |-> t, v |-> v, ep |-> e]
 MCommitRep(i, a, s, t, v)   == [type |-> "CommitRep", txn |-> i, att |-> a, from |-> s, t |-> t, v |-> v]
-MTsAgree(i, s, t, v)        == [type |-> "TsAgree", txn |-> i, from |-> s, t |-> t, v |-> v]
-MRepPrep(i, s, t, v)        == [type |-> "RepPrep", txn |-> i, from |-> s, t |-> t, v |-> v]
-MRepAck(i, s, t, v)         == [type |-> "RepAck", txn |-> i, from |-> s, t |-> t, v |-> v]
-MRepCommit(i, t, v)         == [type |-> "RepCommit", txn |-> i, t |-> t, v |-> v]
+MTsAgree(i, s, t, e, v)     == [type |-> "TsAgree", txn |-> i, from |-> s, t |-> t, ep |-> e, v |-> v]
+MRepPrep(i, s, t, e, v)     == [type |-> "RepPrep", txn |-> i, from |-> s, t |-> t, ep |-> e, v |-> v]
+MRepAck(i, s, t, e, v)      == [type |-> "RepAck", txn |-> i, from |-> s, t |-> t, ep |-> e, v |-> v]
+MRepCommit(i, s, t, e, v)   == [type |-> "RepCommit", txn |-> i, from |-> s, t |-> t, ep |-> e, v |-> v]
+MRepCommitAck(i, s, t, e, v) == [type |-> "RepCommitAck", txn |-> i, from |-> s, t |-> t, ep |-> e, v |-> v]
+MUpg(i, a, e, t, v)         == [type |-> "Upg", txn |-> i, att |-> a, ep |-> e, t |-> t, v |-> v]
+MUpgRep(i, a, c, t, v)      == [type |-> "UpgRep", txn |-> i, att |-> a, committed |-> c, t |-> t, v |-> v]
 
 \* Update helpers.
 SetEnt(s, i, e) == ent' = [ent EXCEPT ![s][i] = e]
@@ -214,6 +262,12 @@ SetEnt(s, i, e) == ent' = [ent EXCEPT ![s][i] = e]
 Bump(s, t, i)   == highest' = [highest EXCEPT ![s] =
                                  IF OKLess(@.t, @.id, t, i) THEN [t |-> t, id |-> i] ELSE @]
 FinalWrite(e)   == e.st = "COMMITTED"   \* COMMITTED (executed writes stay COMMITTED)
+\* Ghost deadline kept when entry e moves to a new epoch (D8): the lowest
+\* position it has held, if it was in the early buffer or SpecLog.
+GhostOf(e) == IF ~Ghost THEN 0
+              ELSE IF e.loc \in {"early", "spec"}
+                   THEN IF e.gt # 0 /\ e.gt < e.t THEN e.gt ELSE e.t
+                   ELSE e.gt
 
 \* Release loop over an ent row E of server s at clock c (alive set A): every
 \* due early-buffer entry moves to SpecLog (a follower's read is only endorsed).
@@ -224,8 +278,22 @@ Released(E, c, A, s) ==
        IF i \notin DueIn(E, c) THEN E[i]
        ELSE IF FollowerRead(A, s, i) THEN [E[i] EXCEPT !.loc = "none"]
        ELSE [E[i] EXCEPT !.loc = "spec", !.st = "SPEC"]]
+\* D10: the newest write on key k that row E holds (SpecLog or executed)
+\* ordered before txn i; 0 if none.
+PrevW(E, i, k) ==
+    LET W == {j \in Txns : /\ IsWrite(j) /\ k \in KeysOf(j)
+                           /\ E[j].loc \in {"spec", "done"}
+                           /\ OKLess(E[j].t, j, E[i].t, i)}
+    IN IF W = {} THEN 0
+       ELSE CHOOSE j \in W : \A j2 \in W : j2 = j \/ OKLess(E[j2].t, j2, E[j].t, j)
+\* A follower's read endorsement carries, per key, the write it holds before
+\* the read (evaluated after the release, so writes released with it count).
 ReleaseReplies(E, c, A, s, v) ==
-    {MSpecRep(i, E[i].att, s, E[i].t, {}, v) :
+    LET E2 == Released(E, c, A, s) IN
+    {MSpecRep(i, E[i].att, s, E[i].t,
+              IF EndorseCheck /\ FollowerRead(A, s, i)
+                THEN {<<k, PrevW(E2, i, k)>> : k \in KeysOf(i)} ELSE {},
+              v) :
        i \in {j \in DueIn(E, c) : IsWrite(j) \/ FollowerRead(A, s, j)}}
 \* max OrderKey among the SpecLog entries of row E and the old highestReleasedT h.
 MaxOKOf(E, h) ==
@@ -257,20 +325,31 @@ Invoke(i) ==
     /\ cl[i].phase = "idle"
     /\ \E t \in Times :
          /\ cl' = [cl EXCEPT ![i].phase = "wait", ![i].att = 1, ![i].t = t]
-         /\ Send({MReq(i, 1, t, cl[i].v, "cast")})
+         /\ Send({MReq(i, 1, t, cl[i].v, "cast", 0)})
     /\ rt' = [rt EXCEPT ![i] = {j \in Txns : cdone[j] # 0}]
     /\ UNCHANGED <<clock, ent, highest, serverOnly, vrVars, cdone, cres>>
 
 SpecReplies(i, a) == {m \in msgs : m.type = "SpecRep" /\ m.txn = i /\ m.att = a
                                    /\ m.v = cl[i].v}
 RepliersAt(i, a, t) == {m.from : m \in {x \in SpecReplies(i, a) : x.t = t}}
+\* D10: the leaders' read results at t; a follower endorsement counts only if
+\* the writes it holds before the read are exactly those results.
+LeaderRes(i, a, t) == UNION {m.res : m \in {x \in SpecReplies(i, a) :
+                                              x.t = t /\ x.from \in CLeaders(i)}}
+FastRepliersAt(i, a, t) ==
+    IF EndorseCheck /\ IsRead(i)
+    THEN {m.from : m \in {x \in SpecReplies(i, a) :
+                            /\ x.t = t
+                            /\ x.from \in CLeaders(i) \/ x.res = LeaderRes(i, a, t)}}
+    ELSE RepliersAt(i, a, t)
 
-\* Fast path (writes and reads): all involved leaders, >= f+1, same (view, t).
+\* Fast path (writes and reads): all involved leaders, >= f+1, same (view, t);
+\* for reads, follower endorsements must match the leaders' results (D10).
 ClientFast(i) ==
     LET a == cl[i].att IN
     /\ cl[i].phase = "wait"
     /\ \E t \in Times :
-         LET S == RepliersAt(i, a, t) IN
+         LET S == FastRepliersAt(i, a, t) IN
          /\ CLeaders(i) \subseteq S
          /\ Cardinality(S) >= F + 1
          /\ cl'    = [cl EXCEPT ![i].phase = "done"]
@@ -280,7 +359,7 @@ ClientFast(i) ==
                      UNION {m.res : m \in {x \in SpecReplies(i, a) :
                                              x.t = t /\ x.from \in CLeaders(i)}}]
               ELSE cres' = cres
-         /\ IF IsWrite(i) THEN Send({MFast(i, a, t, cl[i].v)}) ELSE UNCHANGED msgs
+         /\ IF IsWrite(i) THEN Send({MFast(i, a, t, cl[i].v, cl[i].ep)}) ELSE UNCHANGED msgs
     /\ UNCHANGED <<clock, ent, highest, serverOnly, vrVars, rt>>
 
 \* Slow path (writes): all leaders replied, they disagree, >= f+1 servers replied (D2).
@@ -294,7 +373,7 @@ ClientSlow(i) ==
     /\ Cardinality({m.t : m \in LR}) > 1
     /\ Cardinality({m.from : m \in SpecReplies(i, a)}) >= F + 1
     /\ cl'  = [cl EXCEPT ![i].phase = "slow"]
-    /\ Send({MSlow(i, a, Max({m.t : m \in LR}), cl[i].v)})
+    /\ Send({MSlow(i, a, Max({m.t : m \in LR}), cl[i].v, cl[i].ep)})
     /\ UNCHANGED <<clock, ent, highest, serverOnly, vrVars, cdone, cres, rt>>
 
 \* Commit-Reply quorum (after SlowCommit, or from leader sync) at one deadline.
@@ -311,24 +390,56 @@ ClientCommitReplies(i) ==
             /\ cdone' = [cdone EXCEPT ![i] = t]
     /\ UNCHANGED <<clock, ent, highest, serverOnly, vrVars, msgs, cres, rt>>
 
-\* Recast with a larger deadline (D2/D3); reads retry the same way.
+\* Retry with a larger deadline: reads always; writes only without D8 (D2/D3).
 ClientRecast(i) ==
+    /\ IsRead(i) \/ ~UpgradeGate
     /\ cl[i].phase = "wait"
     /\ cl[i].att < MaxAttempt
     /\ \E t2 \in (cl[i].t + 1)..MaxTime :
          /\ cl' = [cl EXCEPT ![i].att = @ + 1, ![i].t = t2]
-         /\ Send({MReq(i, cl[i].att + 1, t2, cl[i].v, "cast")})
+         /\ Send({MReq(i, cl[i].att + 1, t2, cl[i].v, "cast", cl[i].ep)})
     /\ UNCHANGED <<clock, ent, highest, serverOnly, vrVars, cdone, cres, rt>>
 
-\* ViewInfo: adopt a newer view; restart a pending txn in it with the same t.
+\* D8 round 1: ask the primary to upgrade the write to (t2, next epoch).
+ClientUpgrade(i) ==
+    /\ UpgradeGate
+    /\ IsWrite(i)
+    /\ cl[i].phase = "wait"
+    /\ cl[i].att < MaxAttempt
+    /\ \E t2 \in (cl[i].t + 1)..MaxTime :
+         /\ cl' = [cl EXCEPT ![i].phase = "upg", ![i].att = @ + 1, ![i].ep = @ + 1,
+                             ![i].t = t2]
+         /\ Send({MUpg(i, cl[i].att + 1, cl[i].ep + 1, t2, cl[i].v)})
+    /\ UNCHANGED <<clock, ent, highest, serverOnly, vrVars, cdone, cres, rt>>
+
+\* D8 round 2: the primary answered. Committed -> accept its t; promised ->
+\* cast the new deadline to every server.
+ClientUpgradeReply(i) ==
+    /\ cl[i].phase = "upg"
+    /\ \E m \in msgs :
+         /\ m.type = "UpgRep" /\ m.txn = i /\ m.att = cl[i].att /\ m.v = cl[i].v
+         /\ IF m.committed
+              THEN /\ cl'    = [cl EXCEPT ![i].phase = "done"]
+                   /\ cdone' = [cdone EXCEPT ![i] = m.t]
+                   /\ UNCHANGED msgs
+              ELSE /\ cl'    = [cl EXCEPT ![i].phase = "wait"]
+                   /\ Send({MReq(i, cl[i].att, cl[i].t, cl[i].v, "cast", cl[i].ep)})
+                   /\ UNCHANGED cdone
+    /\ UNCHANGED <<clock, ent, highest, serverOnly, vrVars, cres, rt>>
+
+\* ViewInfo: adopt a newer view; restart a pending txn in it with the same t
+\* (an unanswered upgrade is re-asked of the new view's primary).
 ClientNewView(i) ==
     \E m \in msgs :
       /\ m.type = "ViewInfo"
       /\ m.v > cl[i].v
-      /\ IF cl[i].phase \in {"wait", "slow"} /\ cl[i].att < MaxAttempt
-           THEN /\ cl' = [cl EXCEPT ![i].v = m.v, ![i].A = m.A, ![i].phase = "wait",
+      /\ IF cl[i].phase \in {"wait", "slow", "upg"} /\ cl[i].att < MaxAttempt
+           THEN /\ cl' = [cl EXCEPT ![i].v = m.v, ![i].A = m.A,
+                                    ![i].phase = IF @ = "upg" THEN "upg" ELSE "wait",
                                     ![i].att = @ + 1]
-                /\ Send({MReq(i, cl[i].att + 1, cl[i].t, m.v, "restart")})
+                /\ IF cl[i].phase = "upg"
+                     THEN Send({MUpg(i, cl[i].att + 1, cl[i].ep, cl[i].t, m.v)})
+                     ELSE Send({MReq(i, cl[i].att + 1, cl[i].t, m.v, "restart", cl[i].ep)})
            ELSE /\ cl' = [cl EXCEPT ![i].v = m.v, ![i].A = m.A]
                 /\ UNCHANGED msgs
       /\ UNCHANGED <<clock, ent, highest, serverOnly, vrVars, cdone, cres, rt>>
@@ -336,12 +447,34 @@ ClientNewView(i) ==
 (***************************************************************************)
 (* Server: arrival                                                         *)
 (***************************************************************************)
+\* Classify an arrival of txn i at deadline t (attempt a, epoch e, ghost g).
+Classified(s, i, t, a, e, g) ==
+    LET aboveFloor == OKLess(highest[s].t, highest[s].id, clock[s], i)
+        newT == IF aboveFloor THEN clock[s] ELSE highest[s].t + 1
+        mk(l, st, tt) == [loc |-> l, st |-> st, t |-> tt, att |-> a, ep |-> e, gt |-> g,
+                          dec |-> FALSE]
+    IN
+    IF clock[s] < t THEN mk("early", "NONE", t)       \* on time -> early buffer
+    ELSE IF IsLeader(s, i) THEN                         \* late at a leader (D6)
+         IF aboveFloor THEN mk("spec", "SPEC", newT)    \*   released at once
+                       ELSE mk("early", "NONE", newT)   \*   waits for floor + 1
+    ELSE IF IsWrite(i) THEN mk("late", "NONE", t)       \* late write at a pure follower
+    ELSE [NoEnt EXCEPT !.att = a]                       \* late read at a pure follower: dropped
+
+\* Admit the arrival: store the classified entry; a write released at once
+\* (late leader) replies at once; a read is served by the executor.
+Arrive(s, i, t, a, e, g, extra) ==
+    LET E == Classified(s, i, t, a, e, g) IN
+    /\ E.t <= MaxTime                                   \* model bound
+    /\ SetEnt(s, i, E)
+    /\ IF E.loc = "spec" THEN Bump(s, E.t, i) ELSE UNCHANGED highest
+    /\ Send(extra \cup IF E.loc = "spec" /\ IsWrite(i)
+                       THEN {MSpecRep(i, a, s, E.t, {}, view[s])} ELSE {})
+
 RecvRequest(s, m) ==
     LET i == m.txn
         e == ent[s][i]
-        aboveFloor == OKLess(highest[s].t, highest[s].id, clock[s], i)
-        newT == IF aboveFloor THEN clock[s] ELSE highest[s].t + 1
-        restart == m.kind = "restart"
+        restart == m.kind = "restart" /\ m.ep = e.ep
     IN
     /\ m.type = "Req"
     /\ Normal(s)
@@ -352,6 +485,10 @@ RecvRequest(s, m) ==
           /\ SetEnt(s, i, [e EXCEPT !.att = m.att])
           /\ Send({MSpecRep(i, m.att, s, e.t, {}, view[s])})
           /\ UNCHANGED highest
+       ELSE IF m.ep < e.ep THEN
+          \* From an older epoch than one already adopted: ignored.
+          /\ SetEnt(s, i, [e EXCEPT !.att = m.att])
+          /\ UNCHANGED <<msgs, highest>>
        ELSE IF restart /\ e.loc = "spec" THEN
           \* View-change restart (same t): answer from the live entry.
           /\ SetEnt(s, i, [e EXCEPT !.att = m.att])
@@ -361,29 +498,34 @@ RecvRequest(s, m) ==
        ELSE IF restart /\ e.loc = "early" THEN
           /\ SetEnt(s, i, [e EXCEPT !.att = m.att])     \* replies on release
           /\ UNCHANGED <<msgs, highest>>
-       ELSE IF clock[s] < m.t THEN
-          \* On time -> early buffer (a recast also leaves SpecLog: D3).
-          /\ SetEnt(s, i, [loc |-> "early", st |-> "NONE", t |-> m.t, att |-> m.att])
-          /\ UNCHANGED <<msgs, highest>>
-       ELSE IF IsLeader(s, i) THEN
-          \* Late at a leader: re-timestamp above highestReleasedT (D6).
-          /\ newT <= MaxTime                           \* model bound
-          /\ IF aboveFloor THEN
-                /\ SetEnt(s, i, [loc |-> "spec", st |-> "SPEC", t |-> newT, att |-> m.att])
-                /\ Bump(s, newT, i)
-                /\ IF IsWrite(i) THEN Send({MSpecRep(i, m.att, s, newT, {}, view[s])})
-                                 ELSE UNCHANGED msgs     \* read: the executor serves it
-             ELSE
-                /\ SetEnt(s, i, [loc |-> "early", st |-> "NONE", t |-> newT, att |-> m.att])
-                /\ UNCHANGED <<msgs, highest>>
-       ELSE IF IsWrite(i) THEN
-          \* Late write at a pure follower: late buffer, silently.
-          /\ SetEnt(s, i, [loc |-> "late", st |-> "NONE", t |-> m.t, att |-> m.att])
-          /\ UNCHANGED <<msgs, highest>>
        ELSE
-          \* Late read at a pure follower: dropped.
-          /\ SetEnt(s, i, [NoEnt EXCEPT !.att = m.att])
-          /\ UNCHANGED <<msgs, highest>>
+          \* (Re-)classify: a new epoch keeps a ghost of the old position (D8);
+          \* a same-epoch recast (D3, reads) also leaves SpecLog.
+          Arrive(s, i, m.t, m.att, m.ep, IF m.ep > e.ep THEN GhostOf(e) ELSE e.gt, {})
+    /\ UNCHANGED <<clock, serverOnly, vrVars, clientVars>>
+
+\* D8: the primary answers an upgrade request atomically.
+RecvUpgrade(s, m) ==
+    LET i == m.txn
+        e == ent[s][i]
+    IN
+    /\ m.type = "Upg"
+    /\ Normal(s)
+    /\ m.v = view[s]
+    /\ s = Primary(s, i)
+    /\ ~e.dec                                \* decided, not yet durable: hold the answer
+    /\ IF FinalWrite(e) THEN
+          \* COMMITTED: tell the client its final t; no upgrade.
+          /\ Send({MUpgRep(i, m.att, TRUE, e.t, view[s])})
+          /\ UNCHANGED <<ent, highest>>
+       ELSE IF e.ep >= m.ep THEN
+          \* Already promised this epoch: answer again.
+          /\ e.ep = m.ep
+          /\ Send({MUpgRep(i, m.att, FALSE, m.t, view[s])})
+          /\ UNCHANGED <<ent, highest>>
+       ELSE
+          \* Promise: move to (t', new epoch); epoch-e messages are ignored from now on.
+          Arrive(s, i, m.t, m.att, m.ep, GhostOf(e), {MUpgRep(i, m.att, FALSE, m.t, view[s])})
     /\ UNCHANGED <<clock, serverOnly, vrVars, clientVars>>
 
 (***************************************************************************)
@@ -398,13 +540,17 @@ RecvCommit(s, m) ==
     /\ Normal(s)
     /\ m.v = view[s]
     /\ m.att >= e.att                       \* stale attempt: ignored (D3)
+    /\ m.ep >= e.ep                         \* stale epoch: ignored (D8)
     /\ WaitRule => clock[s] >= m.t          \* D1
-    /\ IF FinalWrite(e) THEN
+    /\ IF FinalWrite(e) \/ e.dec THEN
+          \* COMMITTED, or decided at the primary: t is final.
           /\ UNCHANGED <<ent, highest>>
           /\ IF slow THEN Send({MCommitRep(i, m.att, s, e.t, view[s])}) ELSE UNCHANGED msgs
        ELSE
           \* Found in SpecLog / early / late buffer, or fetched: adopt t, COMMITTING.
-          /\ SetEnt(s, i, [loc |-> "spec", st |-> "COMMITTING", t |-> m.t, att |-> m.att])
+          /\ SetEnt(s, i, [loc |-> "spec", st |-> "COMMITTING", t |-> m.t, att |-> m.att,
+                           ep |-> m.ep, gt |-> IF m.ep > e.ep THEN GhostOf(e) ELSE e.gt,
+                           dec |-> FALSE])
           /\ Bump(s, m.t, i)
           /\ IF slow THEN Send({MCommitRep(i, m.att, s, m.t, view[s])}) ELSE UNCHANGED msgs
     /\ UNCHANGED <<clock, serverOnly, vrVars, clientVars>>
@@ -417,7 +563,7 @@ ProposeTs(s, i) ==
     /\ IsWrite(i)
     /\ IsLeader(s, i)
     /\ ent[s][i].loc \in {"spec", "done"}
-    /\ Send({MTsAgree(i, s, ent[s][i].t, view[s])})
+    /\ Send({MTsAgree(i, s, ent[s][i].t, ent[s][i].ep, view[s])})
     /\ UNCHANGED <<clock, ent, highest, serverOnly, vrVars, clientVars>>
 
 \* SPECULATIVE past the timeout (or inherited at recovery): with a proposal from
@@ -432,7 +578,7 @@ LeaderSync(s, i) ==
     /\ e.st = "SPEC"
     /\ \E P \in [Leaders(s, i) \ {s} -> Times] :
          LET agreed == Max({e.t} \cup Range(P)) IN
-         /\ \A l \in Leaders(s, i) \ {s} : MTsAgree(i, l, P[l], view[s]) \in msgs
+         /\ \A l \in Leaders(s, i) \ {s} : MTsAgree(i, l, P[l], e.ep, view[s]) \in msgs
          /\ WaitRule => clock[s] >= agreed
          /\ SetEnt(s, i, [e EXCEPT !.st = "COMMITTING", !.t = agreed])
          /\ Bump(s, agreed, i)
@@ -448,10 +594,11 @@ SendPrepare(s, i) ==
     /\ s = Primary(s, i)
     /\ ent[s][i].loc = "spec"
     /\ ent[s][i].st = "COMMITTING"
-    /\ Send({MRepPrep(i, s, ent[s][i].t, view[s])})
+    /\ ~ent[s][i].dec
+    /\ Send({MRepPrep(i, s, ent[s][i].t, ent[s][i].ep, view[s])})
     /\ UNCHANGED <<clock, ent, highest, serverOnly, vrVars, clientVars>>
 
-\* Ack only if already holding the txn in SpecLog at exactly t; never overwrite.
+\* Ack only if already holding the txn in SpecLog at exactly (t, epoch); never overwrite.
 RecvPrepare(s, m) ==
     LET e == ent[s][m.txn] IN
     /\ m.type = "RepPrep"
@@ -461,48 +608,81 @@ RecvPrepare(s, m) ==
     /\ IF PrepOverwrites /\ ~FinalWrite(e) THEN
           \* Old code (installCommittingLocked): adopt from anywhere, then ack.
           /\ WaitRule => clock[s] >= m.t
-          /\ SetEnt(s, m.txn, [loc |-> "spec", st |-> "COMMITTING", t |-> m.t, att |-> e.att])
+          /\ SetEnt(s, m.txn, [loc |-> "spec", st |-> "COMMITTING", t |-> m.t, att |-> e.att,
+                               ep |-> m.ep, gt |-> e.gt, dec |-> FALSE])
           /\ Bump(s, m.t, m.txn)
        ELSE
           /\ e.loc \in {"spec", "done"}
           /\ e.t = m.t
+          /\ e.ep = m.ep
           /\ UNCHANGED <<ent, highest>>
-    /\ Send({MRepAck(m.txn, s, m.t, view[s])})
+    /\ Send({MRepAck(m.txn, s, m.t, m.ep, view[s])})
     /\ UNCHANGED <<clock, serverOnly, vrVars, clientVars>>
 
-\* f+1 holders including the primary -> COMMITTED; Replicate-Commit to all.
-PrimaryCommit(s, i) ==
+\* f+1 holders including the primary -> decided (D9) or COMMITTED (old);
+\* Replicate-Commit to all.
+PrimaryDecide(s, i) ==
     LET e == ent[s][i] IN
     /\ Normal(s)
     /\ IsWrite(i)
     /\ s = Primary(s, i)
     /\ e.loc = "spec"
     /\ e.st = "COMMITTING"
-    /\ Cardinality({q \in Servers \ {s} : MRepAck(i, q, e.t, view[s]) \in msgs}) >= F
-    /\ SetEnt(s, i, [e EXCEPT !.st = "COMMITTED"])
-    /\ Send({MRepCommit(i, e.t, view[s])})
+    /\ ~e.dec
+    /\ Cardinality({q \in Servers \ {s} : MRepAck(i, q, e.t, e.ep, view[s]) \in msgs}) >= F
+    /\ IF DurableCommit THEN SetEnt(s, i, [e EXCEPT !.dec = TRUE])
+                        ELSE SetEnt(s, i, [e EXCEPT !.st = "COMMITTED", !.gt = 0])
+    /\ Send({MRepCommit(i, s, e.t, e.ep, view[s])})
     /\ UNCHANGED <<clock, highest, serverOnly, vrVars, clientVars>>
 
-\* Replicate-Commit overwrites (still waiting until clock >= t, D1).
+\* A decided server re-sends Replicate-Commit (e.g. in a new view).
+ResendDecision(s, i) ==
+    LET e == ent[s][i] IN
+    /\ Normal(s)
+    /\ e.dec
+    /\ Send({MRepCommit(i, s, e.t, e.ep, view[s])})
+    /\ UNCHANGED <<clock, ent, highest, serverOnly, vrVars, clientVars>>
+
+\* D9: f Replicate-Commit acks -> the decision is durable -> COMMITTED.
+PrimaryDurable(s, i) ==
+    LET e == ent[s][i] IN
+    /\ Normal(s)
+    /\ e.dec
+    /\ Cardinality({q \in Servers \ {s} : MRepCommitAck(i, q, e.t, e.ep, view[s]) \in msgs}) >= F
+    /\ SetEnt(s, i, [e EXCEPT !.st = "COMMITTED", !.gt = 0, !.dec = FALSE])
+    /\ UNCHANGED <<clock, highest, serverOnly, vrVars, msgs, clientVars>>
+
+\* Replicate-Commit overwrites (still waiting until clock >= t, D1); acked under D9.
 RecvRepCommit(s, m) ==
     LET e == ent[s][m.txn] IN
     /\ m.type = "RepCommit"
     /\ Normal(s)
     /\ m.v = view[s]
+    /\ s # m.from
     /\ WaitRule => clock[s] >= m.t
-    /\ ~FinalWrite(e)
-    /\ SetEnt(s, m.txn, [loc |-> "spec", st |-> "COMMITTED", t |-> m.t, att |-> e.att])
-    /\ Bump(s, m.t, m.txn)
-    /\ UNCHANGED <<clock, msgs, serverOnly, vrVars, clientVars>>
+    /\ IF FinalWrite(e) THEN
+          /\ e.t = m.t
+          /\ UNCHANGED <<ent, highest>>
+       ELSE
+          /\ SetEnt(s, m.txn, [loc |-> "spec", st |-> "COMMITTED", t |-> m.t, att |-> e.att,
+                               ep |-> m.ep, gt |-> 0, dec |-> FALSE])
+          /\ Bump(s, m.t, m.txn)
+    /\ IF DurableCommit THEN Send({MRepCommitAck(m.txn, s, m.t, m.ep, view[s])})
+                        ELSE UNCHANGED msgs
+    /\ UNCHANGED <<clock, serverOnly, vrVars, clientVars>>
 
 (***************************************************************************)
 (* Execution (dependency order) and leader reads                           *)
 (***************************************************************************)
-\* No smaller-OrderKey conflicting txn is still in s's SpecLog.
+\* No smaller-OrderKey conflicting txn is still in s's SpecLog, and no
+\* conflicting txn holds a ghost below i (D8).
 Unblocked(s, i) ==
-    ~\E j \in Txns : /\ ent[s][j].loc = "spec"
-                     /\ Conflict(i, j)
-                     /\ OKLess(ent[s][j].t, j, ent[s][i].t, i)
+    ~\E j \in Txns : /\ Conflict(i, j)
+                     /\ \/ /\ ent[s][j].loc = "spec"
+                           /\ OKLess(ent[s][j].t, j, ent[s][i].t, i)
+                        \/ /\ ent[s][j].gt # 0
+                           /\ ent[s][j].loc \in {"early", "spec", "late"}
+                           /\ OKLess(ent[s][j].gt, j, ent[s][i].t, i)
 
 ExecuteWrite(s, i) ==
     LET e == ent[s][i] IN
@@ -633,7 +813,9 @@ Excluded(s, m) ==
 \* What server s contributes to PL p's M: its SpecLog writes touching D (with
 \* status and t) and its executed key-values in D.
 Data(s, D) ==
-    [txns |-> {[id |-> i, t |-> ent[s][i].t, st |-> ent[s][i].st] :
+    [txns |-> {[id |-> i, t |-> ent[s][i].t, ep |-> ent[s][i].ep,
+                \* a decided entry is reported as COMMITTED (f+1 hold it at t)
+                st |-> IF ent[s][i].dec THEN "COMMITTED" ELSE ent[s][i].st] :
                  i \in {j \in Txns : IsWrite(j) /\ ent[s][j].loc = "spec"
                                      /\ KeysOf(j) \cap D # {}}},
      kvs  |-> {[k |-> k, w |-> store[s][k].w, t |-> store[s][k].t] :
@@ -647,8 +829,15 @@ AnswerRecReq(s, m) ==
               d |-> Data(s, Delta(m.oldA, m.A, m.from))]})
     /\ UNCHANGED <<clock, ent, highest, serverOnly, vrVars, clientVars>>
 
-\* Merge: per txn COMMITTED > COMMITTING > SPEC, then max t; per key max OrderKey.
-Better(r1, r2) == Rank(r1.st) > Rank(r2.st) \/ (Rank(r1.st) = Rank(r2.st) /\ r1.t > r2.t)
+\* Merge: per txn COMMITTED first, then the highest epoch (D8), then
+\* COMMITTING > SPEC, then max t; per key max OrderKey.
+Better(r1, r2) ==
+    LET c1 == r1.st = "COMMITTED"
+        c2 == r2.st = "COMMITTED"
+    IN \/ c1 /\ ~c2
+       \/ c1 = c2 /\ r1.ep > r2.ep
+       \/ c1 = c2 /\ r1.ep = r2.ep /\ Rank(r1.st) > Rank(r2.st)
+       \/ c1 = c2 /\ r1.ep = r2.ep /\ Rank(r1.st) = Rank(r2.st) /\ r1.t > r2.t
 Merge(DS) ==
     LET T == UNION {d.txns : d \in DS}
         K == UNION {d.kvs : d \in DS}
@@ -705,12 +894,20 @@ SendStartView(s) ==
 
 \* Install one recovered txn record r over entry e (never downgrade, never
 \* re-install an executed txn; an early-buffer copy is kept unless r is decided).
+\* A COMMITTED record wins; otherwise a newer epoch wins (leaving a ghost, D8).
 InstallOne(e, r) ==
-    IF e.loc = "done" THEN e
+    IF e.loc = "done" \/ e.st = "COMMITTED" THEN e
+    ELSE IF r.st = "COMMITTED"
+         THEN [loc |-> "spec", st |-> "COMMITTED", t |-> r.t, att |-> e.att, ep |-> r.ep,
+               gt |-> 0, dec |-> FALSE]
+    ELSE IF r.ep > e.ep
+         THEN [loc |-> "spec", st |-> r.st, t |-> r.t, att |-> e.att, ep |-> r.ep,
+               gt |-> GhostOf(e), dec |-> FALSE]
+    ELSE IF r.ep < e.ep \/ e.dec THEN e
     ELSE IF e.loc = "spec"
          THEN IF Rank(r.st) > Rank(e.st) THEN [e EXCEPT !.t = r.t, !.st = r.st] ELSE e
     ELSE IF e.loc = "early" /\ r.st = "SPEC" THEN e
-    ELSE [loc |-> "spec", st |-> r.st, t |-> r.t, att |-> e.att]
+    ELSE [e EXCEPT !.loc = "spec", !.st = r.st, !.t = r.t]
 
 \* Fold the M's of PLs p..N (in PL order) into entry e of txn i.
 RECURSIVE InstFold(_, _, _, _)
@@ -763,12 +960,15 @@ Next ==
     \/ \E s \in Servers : Tick(s)
     \/ \E i \in Txns : Invoke(i) \/ ClientFast(i) \/ ClientSlow(i)
                        \/ ClientCommitReplies(i) \/ ClientRecast(i) \/ ClientNewView(i)
+                       \/ ClientUpgrade(i) \/ ClientUpgradeReply(i)
     \/ \E s \in Servers, m \in msgs :
          \/ RecvRequest(s, m) \/ RecvCommit(s, m) \/ RecvPrepare(s, m) \/ RecvRepCommit(s, m)
+         \/ RecvUpgrade(s, m)
          \/ JoinVC(s, m) \/ AcceptRec(s, m) \/ Excluded(s, m) \/ AnswerRecReq(s, m)
          \/ AcceptPrep(s, m) \/ Install(s, m)
     \/ \E s \in Servers, i \in Txns :
-         ProposeTs(s, i) \/ LeaderSync(s, i) \/ SendPrepare(s, i) \/ PrimaryCommit(s, i)
+         ProposeTs(s, i) \/ LeaderSync(s, i) \/ SendPrepare(s, i) \/ PrimaryDecide(s, i)
+         \/ ResendDecision(s, i) \/ PrimaryDurable(s, i)
          \/ ExecuteWrite(s, i) \/ ServeRead(s, i)
     \/ \E s \in Servers :
          Crash(s) \/ StartVC(s) \/ SendDVC(s) \/ LeaderStartRec(s) \/ BuildM(s)
@@ -794,7 +994,11 @@ TypeOK ==
     /\ \A s \in Servers, i \in Txns :
          /\ ent[s][i].loc \in {"none", "early", "late", "spec", "done"}
          /\ ent[s][i].st \in {"NONE", "SPEC", "COMMITTING", "COMMITTED"}
-    /\ \A i \in Txns : cl[i].phase \in {"idle", "wait", "slow", "done"}
+         /\ ent[s][i].ep \in 0..MaxAttempt
+         /\ ent[s][i].gt \in 0..MaxTime
+         /\ ent[s][i].dec \in BOOLEAN
+         /\ ent[s][i].dec => ent[s][i].st = "COMMITTING"
+    /\ \A i \in Txns : cl[i].phase \in {"idle", "wait", "slow", "upg", "done"}
 
 \* AGREEMENT: a write commits at one deadline everywhere, and it is the one its
 \* client was told.
@@ -835,12 +1039,13 @@ ReadConsistency ==
                          /\ OKLess(FinalT(w2), w2, cdone[r], r))
                         => (w # 0 /\ OKLess(FinalT(w2), w2, FinalT(w), w))
 
-\* DURABILITY at the leader: in any view, the current leader of a key of a
+\* DURABILITY at the leader: in the newest view, the current leader of a key of a
 \* client-committed write holds that write at its deadline, or a value on the
-\* key at least as new.
+\* key at least as new. (A server still Normal in an older view is stale: it
+\* can neither execute nor answer COMMITTED without acks from the new view.)
 LeaderKnows ==
     \A i \in Txns : (IsWrite(i) /\ cdone[i] # 0) =>
-        \A s \in Servers : Normal(s) =>
+        \A s \in Servers : (Normal(s) /\ view[s] = Max({view[x] : x \in Servers})) =>
             \A k \in {x \in KeysOf(i) : Owner(x, salive[s]) = s} :
                 \/ ent[s][i].loc \in {"spec", "done"} /\ ent[s][i].t = cdone[i]
                 \/ ~OKLess(store[s][k].t, store[s][k].w, cdone[i], i)
