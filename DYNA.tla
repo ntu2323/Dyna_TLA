@@ -76,6 +76,28 @@
 (*      on-time holders, which meet r's fast quorum: the leader includes   *)
 (*      it, or the follower holds it before endorsing -- arriving later it *)
 (*      is late there, since the follower's clock has reached r's t.)      *)
+(*      2026-11-09: NOT SUFFICIENT alone -- recovery could turn a late or   *)
+(*      missing copy into a SpecLog copy @t, manufacturing a holder (RD).  *)
+(*                                                                         *)
+(* Change of 2026-11-09 (TLC, RD: B held w late; recovery installed w @t   *)
+(* on B from C's copy; B + C committed w @t, before a read A served):      *)
+(*  D11. LATE STAYS LATE (switch LateSticky). Recovery install never makes *)
+(*      a server a holder: a server that held T late (or not at all) keeps *)
+(*      it late, blocking conflicting txns from its t, unless M says       *)
+(*      COMMITTED. Leader sync needs a SpecLog copy, so it can't either. A *)
+(*      late copy becomes a holder only by a client commit (Fast/Slow-     *)
+(*      Commit: the client saw f+1 on-time holders) or Replicate-Commit.   *)
+(*      A client whose write completed re-sends its commit in each new     *)
+(*      view (in the code: until the leader acks), so a write that really  *)
+(*      was fast-committed is not stuck; one that was not is upgraded.     *)
+(*  D12. READ FLOOR (switch ReadFloor). A follower that endorses read r    *)
+(*      raises its highestReleased to r's OrderKey; recovery replies carry *)
+(*      highestReleased and every installer raises its own to the max in   *)
+(*      the M's. A new leader then re-timestamps a late write (D6) above   *)
+(*      any read the failed leader may have served (r's f endorsers meet   *)
+(*      every f+1 recovery quorum). (RD with D11 only: the client restarted*)
+(*      w in the new view and the new leader, late, re-timestamped it to   *)
+(*      the same t, under a read the old leader had served.)               *)
 (*                                                                         *)
 (* Recovery (design doc "Recovery"; Go internal/vr, orderer/recovery.go):  *)
 (*  - A view is (view id, alive set); its VR leader is the min-id alive    *)
@@ -133,14 +155,17 @@ CONSTANTS
     TGuard,      \* TRUE: execution never overwrites a key with an older OrderKey
     \* Rule switches. The protocol under check: WaitRule = TRUE,
     \* PrepOverwrites = FALSE, InstallWait = TRUE, UpgradeGate = TRUE,
-    \* Ghost = TRUE, DurableCommit = TRUE, EndorseCheck = TRUE.
+    \* Ghost = TRUE, DurableCommit = TRUE, EndorseCheck = TRUE, LateSticky = TRUE,
+    \* ReadFloor = TRUE.
     WaitRule,       \* D1 on/off
     PrepOverwrites, \* TRUE: old code -- ReplicatePrepare installs COMMITTING at t and acks
     InstallWait,    \* D7 on/off
     UpgradeGate,    \* D8 on; FALSE: D2/D3 one-step recast for writes
     Ghost,          \* D8 ghost blocking on/off
     DurableCommit,  \* D9 on; FALSE: primary COMMITTED on f prepare acks (old)
-    EndorseCheck    \* D10 on; FALSE: follower read endorsements carry nothing (old)
+    EndorseCheck,   \* D10 on; FALSE: follower read endorsements carry nothing (old)
+    LateSticky,     \* D11 on; FALSE: recovery install turns any copy into SpecLog @t (old)
+    ReadFloor       \* D12 on; FALSE: read endorsements / recovery leave highestReleased alone (old)
 
 Servers  == 1..N
 F        == (N - 1) \div 2
@@ -209,7 +234,7 @@ clientVars == <<cl, cdone, cres, rt>>
 vars == <<clock, ent, highest, store, execSeq, vrVars, msgs, clientVars>>
 
 NoEnt == [loc |-> "none", st |-> "NONE", t |-> 0, att |-> 0, ep |-> 0, gt |-> 0, dec |-> FALSE]
-NoM   == [has |-> FALSE, txns |-> {}, kvs |-> {}]
+NoM   == [has |-> FALSE, txns |-> {}, kvs |-> {}, fl |-> [t |-> 0, id |-> 0]]
 
 Init ==
     /\ clock   = [s \in Servers |-> 0]
@@ -299,6 +324,11 @@ ReleaseReplies(E, c, A, s, v) ==
 MaxOKOf(E, h) ==
     LET C == {[t |-> E[i].t, id |-> i] : i \in {j \in Txns : E[j].loc = "spec"}} \cup {h}
     IN CHOOSE x \in C : \A y \in C : ~OKLess(x.t, x.id, y.t, y.id)
+MaxOK(C) == CHOOSE x \in C : \A y \in C : ~OKLess(x.t, x.id, y.t, y.id)
+\* D12: the read endorsements released from row E0 at clock c raise the floor.
+EndorsedFloor(E0, c, A, s) ==
+    IF ReadFloor THEN {[t |-> E0[i].t, id |-> i] : i \in {j \in DueIn(E0, c) : FollowerRead(A, s, j)}}
+    ELSE {}
 
 (***************************************************************************)
 (* Clocks (and the release loop, paused during a view change)              *)
@@ -311,7 +341,9 @@ Tick(s) ==
     /\ clock[s] < MaxTime
     /\ clock' = [clock EXCEPT ![s] = c]
     /\ ent' = [ent EXCEPT ![s] = E]
-    /\ highest' = [highest EXCEPT ![s] = MaxOKOf(E, @)]
+    /\ highest' = [highest EXCEPT ![s] =
+                     MaxOK({MaxOKOf(E, @)} \cup IF Normal(s) THEN EndorsedFloor(ent[s], c, salive[s], s)
+                                                            ELSE {})]
     /\ IF Normal(s) THEN Send(ReleaseReplies(ent[s], c, salive[s], s, view[s]))
                     ELSE UNCHANGED msgs
     /\ UNCHANGED <<serverOnly, vrVars, clientVars>>
@@ -426,6 +458,17 @@ ClientUpgradeReply(i) ==
                    /\ Send({MReq(i, cl[i].att, cl[i].t, cl[i].v, "cast", cl[i].ep)})
                    /\ UNCHANGED cdone
     /\ UNCHANGED <<clock, ent, highest, serverOnly, vrVars, cres, rt>>
+
+\* D11: a client whose write completed re-sends its commit (its proof that f+1
+\* servers held the write on time at that t) in its current view, so a server
+\* holding the write only late can become a holder after a view change.
+ClientResendCommit(i) ==
+    /\ LateSticky
+    /\ IsWrite(i)
+    /\ cl[i].phase = "done"
+    /\ MFast(i, cl[i].att, cdone[i], cl[i].v, cl[i].ep) \notin msgs
+    /\ Send({MFast(i, cl[i].att, cdone[i], cl[i].v, cl[i].ep)})
+    /\ UNCHANGED <<clock, ent, highest, serverOnly, vrVars, clientVars>>
 
 \* ViewInfo: adopt a newer view; restart a pending txn in it with the same t
 \* (an unanswered upgrade is re-asked of the new view's primary).
@@ -819,7 +862,8 @@ Data(s, D) ==
                  i \in {j \in Txns : IsWrite(j) /\ ent[s][j].loc = "spec"
                                      /\ KeysOf(j) \cap D # {}}},
      kvs  |-> {[k |-> k, w |-> store[s][k].w, t |-> store[s][k].t] :
-                 k \in {x \in D : store[s][x].w # 0}}]
+                 k \in {x \in D : store[s][x].w # 0}},
+     fl   |-> highest[s]]   \* D12: its highestReleased (incl. endorsed reads)
 
 AnswerRecReq(s, m) ==
     /\ m.type = "RecReq"
@@ -845,7 +889,8 @@ Merge(DS) ==
         txns |-> {CHOOSE r \in T : r.id = id /\ \A r2 \in T : r2.id = id => ~Better(r2, r) :
                     id \in {r.id : r \in T}},
         kvs  |-> {CHOOSE x \in K : x.k = k /\ \A y \in K : y.k = k => ~OKLess(x.t, x.w, y.t, y.w) :
-                    k \in {x.k : x \in K}}]
+                    k \in {x.k : x \in K}},
+        fl   |-> MaxOK({d.fl : d \in DS})]
 
 Built(s) == \E m \in msgs : m.type = "RecPrep" /\ m.v = pv[s] /\ m.from = s
 
@@ -900,6 +945,11 @@ InstallOne(e, r) ==
     ELSE IF r.st = "COMMITTED"
          THEN [loc |-> "spec", st |-> "COMMITTED", t |-> r.t, att |-> e.att, ep |-> r.ep,
                gt |-> 0, dec |-> FALSE]
+    ELSE IF LateSticky /\ e.loc \in {"none", "late"} /\ r.ep >= e.ep
+         \* D11: a server that did not hold T on time does not become a holder by
+         \* recovery: it keeps T late (body only), blocking from r.t like a ghost.
+         THEN [loc |-> "late", st |-> "NONE", t |-> r.t, att |-> e.att, ep |-> r.ep,
+               gt |-> r.t, dec |-> FALSE]
     ELSE IF r.ep > e.ep
          THEN [loc |-> "spec", st |-> r.st, t |-> r.t, att |-> e.att, ep |-> r.ep,
                gt |-> GhostOf(e), dec |-> FALSE]
@@ -942,7 +992,11 @@ Install(s, m) ==
                            ELSE store[s][k]
                       ELSE store[s][k]]]
     /\ ent'     = [ent EXCEPT ![s] = E2]
-    /\ highest' = [highest EXCEPT ![s] = MaxOKOf(E2, @)]
+    \* D12: the new floor also covers every floor reported in the M's.
+    /\ highest' = [highest EXCEPT ![s] =
+                     MaxOK({MaxOKOf(E2, @)} \cup EndorsedFloor(E1, clock[s], m.A, s)
+                           \cup IF ReadFloor THEN {MM[p].fl : p \in {q \in Servers : MM[q].has}}
+                                 ELSE {})]
     /\ vst'     = [vst EXCEPT ![s] = "normal"]
     /\ view'    = [view EXCEPT ![s] = m.v]
     /\ salive'  = [salive EXCEPT ![s] = m.A]
@@ -960,7 +1014,7 @@ Next ==
     \/ \E s \in Servers : Tick(s)
     \/ \E i \in Txns : Invoke(i) \/ ClientFast(i) \/ ClientSlow(i)
                        \/ ClientCommitReplies(i) \/ ClientRecast(i) \/ ClientNewView(i)
-                       \/ ClientUpgrade(i) \/ ClientUpgradeReply(i)
+                       \/ ClientUpgrade(i) \/ ClientUpgradeReply(i) \/ ClientResendCommit(i)
     \/ \E s \in Servers, m \in msgs :
          \/ RecvRequest(s, m) \/ RecvCommit(s, m) \/ RecvPrepare(s, m) \/ RecvRepCommit(s, m)
          \/ RecvUpgrade(s, m)
@@ -1048,6 +1102,8 @@ LeaderKnows ==
         \A s \in Servers : (Normal(s) /\ view[s] = Max({view[x] : x \in Servers})) =>
             \A k \in {x \in KeysOf(i) : Owner(x, salive[s]) = s} :
                 \/ ent[s][i].loc \in {"spec", "done"} /\ ent[s][i].t = cdone[i]
+                \* D11: held late (blocking from its t) until the client's commit arrives
+                \/ LateSticky /\ ent[s][i].loc = "late" /\ ent[s][i].gt = cdone[i]
                 \/ ~OKLess(store[s][k].t, store[s][k].w, cdone[i], i)
 
 \* EXECUTION ORDER: every server executes conflicting writes in OrderKey order.

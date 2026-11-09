@@ -50,6 +50,32 @@ Scn1WConstraint ==
     /\ (\E s \in Servers : vst[s] # "normal") => (ent[1][1].dec \/ ent[1][1].st = "COMMITTED")
     /\ (cl[1].phase = "upg" \/ cdone[1] # 0) => cl[1].v = 1
     /\ \A s \in Servers : (vst[s] = "normal" /\ view[s] = 0) => clock[s] <= 1
+(* D10 read bug, targeted (RecWorkload: w = txn 1, r = txn 2, key 1 led by
+   server 1 = A): both at t = 3 (w ordered first), no slow path / upgrade /
+   read recast; only A may fail, and only after serving r; w never reaches A;
+   view-change activity only once r has completed. Keeps the bug's family.  *)
+RdConstraint ==
+    /\ cl[1].t \in {0, 3}
+    /\ cl[2].t \in {0, 3}
+    /\ cl[1].phase \notin {"slow", "upg"}
+    /\ cl[2].att <= 1
+    /\ \A s \in {2, 3} : vst[s] \notin {"crashed", "out"}
+    /\ vst[1] = "crashed" => ent[1][2].loc = "done"
+    /\ ent[1][1].loc = "none"
+    /\ (\E s \in Servers : vst[s] \in {"vc", "rec"}) => cdone[2] # 0
+(* D11 fast-committed side (RecWorkload): w at t = 3 is fast-committed by
+   its client (A + a follower) before A fails; r at t = 3 (after w) may be
+   served in either view. Only A may fail; view-change activity only once w
+   has completed. Checks that a late-held inherited w is neither lost nor
+   skipped by a read.                                                      *)
+RxConstraint ==
+    /\ cl[1].t \in {0, 3}
+    /\ cl[2].t \in {0, 3}
+    /\ cl[1].phase \notin {"slow", "upg"}
+    /\ \A s \in {2, 3} : vst[s] \notin {"crashed", "out"}
+    /\ (\E s \in Servers : vst[s] \in {"vc", "rec"}) => cdone[1] # 0
+\* Canary (expected to be VIOLATED: proves RX reaches its target state).
+RxCanary == ~(cdone[1] = 3 /\ vst[1] = "crashed" /\ view[2] = 1 /\ ent[2][1].loc = "late")
 (* N = 5 recovery model (keys 1, 2 led by servers 1, 2): a two-partition write
    (primary 1, second leader 2), then a read on each key.                    *)
 N5MultiWorkload == << [type |-> "W", keys |-> {1, 2}], [type |-> "R", keys |-> {1}],
